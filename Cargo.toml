@@ -1,0 +1,16 @@
+[package]
+name = "winapi-zig"
+version = "0.1.0"
+authors = ["Raph Levien <raph.levien@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+colored = "1.7"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+
+[dependencies.syn]
+version = "1.0.42"
+default-features = false
+features = ["parsing", "full", "extra-traits"]
