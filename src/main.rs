@@ -10,8 +10,9 @@ use std::process;
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::{
-    Expr, FnArg, ForeignItem, Item, ItemConst, ItemFn, ItemForeignMod, ItemMacro, ItemStruct,
+    Attribute, Expr, FnArg, ForeignItem, Item, ItemConst, ItemFn, ItemForeignMod, ItemMacro, ItemStruct,
     ItemType, ItemUse, Lit, Pat, PathArguments, ReturnType, Type, TypePath, UseTree, Visibility,
+    UnOp, TypeBareFn, BareFnArg,
 };
 #[allow(unused)]
 enum Error {
@@ -62,6 +63,16 @@ fn path_as_single_ident(path: &syn::Path) -> Option<String> {
     None
 }
 
+fn path_equals(path: &syn::Path, id: &str) -> bool {
+    if path.segments.len() == 1 {
+        let seg = &path.segments[0];
+        if seg.arguments == PathArguments::None {
+            return seg.ident == id;
+        }
+    }
+    false
+}
+
 fn ty_to_zig(ty: &Type) -> Result<String, Error> {
     match ty {
         Type::Path(TypePath { path, .. }) => {
@@ -71,8 +82,12 @@ fn ty_to_zig(ty: &Type) -> Result<String, Error> {
                     let mut ident = seg.ident.to_string();
                     // Zig doesn't have c char types.
                     match ident.as_str() {
+                        "c_void" => ident = "std::os::raw::c_void".into(),
                         "c_uchar" => ident = "u8".into(),
                         "c_char" | "c_schar" => ident = "i8".into(),
+                        "c_float" => ident = "f32".into(),
+                        "c_double" => ident = "f64".into(),
+                        "wchar_t" => ident = "u16".into(),
                         "__uint64" => ident = "u64".into(),
                         "__int64" => ident = "i64".into(),
                         _ => (),
@@ -115,9 +130,45 @@ fn expr_to_zig(e: &Expr) -> String {
             Lit::Int(i) => return i.to_string(),
             _ => (),
         },
-        _ => (),
+        Expr::Unary(u) => {
+            if let UnOp::Neg(_) = u.op {
+                // Risk of precedence issue here.
+                return format!("-{}", expr_to_zig(&u.expr));
+            }
+        }
+        Expr::Path(p) => {
+            if let Some(ident) = path_as_single_ident(&p.path) {
+                return ident;
+            }
+        }
+        _ => {
+            println!("// {:?}", e);
+        }
     }
     "???".into()
+}
+
+/// Determine whether we should keep this item.
+fn resolve_attrs(attrs: &[Attribute]) -> bool {
+    for attr in attrs {
+        if path_equals(&attr.path, "cfg") {
+            let mut body = attr.tokens.clone().into_iter();
+            if let Some(TokenTree::Group(g)) = body.next() {
+                let mut toks = g.stream().clone().into_iter();
+                if let Some(TokenTree::Ident(id)) = toks.next() {
+                    if id == "target_pointer_width" {
+                        toks.next();
+                        if let Some(TokenTree::Literal(l)) = toks.next() {
+                            if l.to_string() == "\"32\"" {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 type UsePath = Vec<String>;
@@ -175,6 +226,9 @@ fn const_to_zig(c: &ItemConst) {
 }
 
 fn type_to_zig(t: &ItemType) -> Result<(), Error> {
+    if !resolve_attrs(&t.attrs) {
+        return Ok(());
+    }
     //println!("{:#?}", t);
     let vis = vis_to_zig(&t.vis);
     let ident = t.ident.to_string();
@@ -192,6 +246,16 @@ fn fn_arg_to_zig(arg: &FnArg) -> Result<(), Error> {
             _ => (),
         }
         println!("    {}: {},", ident, ty_to_zig(&t.ty)?);
+    }
+    Ok(())
+}
+
+fn bare_fn_arg_to_zig(arg: &BareFnArg) -> Result<(), Error> {
+    if let Some((ident, _)) = &arg.name {
+        println!("    {}: {},", ident, ty_to_zig(&arg.ty)?);
+    } else {
+        println!("    {},", ty_to_zig(&arg.ty)?);
+
     }
     Ok(())
 }
@@ -238,11 +302,29 @@ fn declare_handle_to_zig(toks: &TokenStream) -> Result<(), Error> {
     Ok(())
 }
 
+fn fn_macro_to_zig(toks: &TokenStream) -> Result<(), Error> {
+    let mut tok_iter = toks.clone().into_iter();
+    if let Some(TokenTree::Ident(_callconv)) = tok_iter.next() {
+        let ident = tok_iter.next().unwrap();
+        let mut inner_fn: TokenStream = "fn".parse().unwrap();
+        inner_fn.extend(tok_iter);
+        // TODO: better error
+        let bare_fn: TypeBareFn = syn::parse2(inner_fn).map_err(|_| Error::Nyi)?;
+        println!("pub const {} = fn(", ident);
+        for arg in &bare_fn.inputs {
+            bare_fn_arg_to_zig(arg)?;
+        }
+        println!(") callconv(.Stdcall) {};", ret_ty_to_zig(&bare_fn.output)?);
+    }
+    Ok(())
+}
+
 fn macro_to_zig(m: &ItemMacro) -> Result<(), Error> {
     if let Some(id) = path_as_single_ident(&m.mac.path) {
         match id.as_str() {
             "STRUCT" => struct_macro_to_zig(&m.mac.tokens),
             "DECLARE_HANDLE" => declare_handle_to_zig(&m.mac.tokens),
+            "FN" => fn_macro_to_zig(&m.mac.tokens),
             _ => Err(Error::Unhandled(id)),
         }
     } else {
